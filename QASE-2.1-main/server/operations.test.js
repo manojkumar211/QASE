@@ -1,0 +1,134 @@
+import assert from 'node:assert/strict';
+import express from 'express';
+import test from 'node:test';
+import { createOperationalControls } from './operations.js';
+
+const TOKEN = 'phase-five-metrics-token-at-least-32-bytes';
+
+async function listen(app) {
+	const server = await new Promise(resolve => {
+		const candidate = app.listen(0, '127.0.0.1', () => resolve(candidate));
+	});
+	const origin = `http://127.0.0.1:${server.address().port}`;
+	return { origin, close: () => new Promise(resolve => server.close(resolve)) };
+}
+
+test('request telemetry uses generated IDs and normalized routes', async t => {
+	const controls = createOperationalControls({ environment: {}, now: (() => {
+		let value = 0n;
+		return () => (value += 10_000_000n);
+	})() });
+	const app = express();
+	app.use(controls.middleware);
+	app.get('/api/sessions/:id', (_request, response) => response.json({ ok: true }));
+	const server = await listen(app);
+	t.after(server.close);
+	const response = await fetch(`${server.origin}/api/sessions/secret-run-id`);
+	assert.equal(response.status, 200);
+	assert.match(response.headers.get('x-request-id'), /^[0-9a-f-]{36}$/);
+	const metrics = await controls.render();
+	assert.match(metrics, /route="\/api\/sessions\/:id"/);
+	assert.doesNotMatch(metrics, /secret-run-id/);
+});
+
+test('mutation concurrency rejects excess work without limiting reads', async t => {
+	let release;
+	const held = new Promise(resolve => { release = resolve; });
+	let enter;
+	const entered = new Promise(resolve => { enter = resolve; });
+	const controls = createOperationalControls({ environment: {}, mutationLimit: 1 });
+	const app = express();
+	app.use(controls.middleware);
+	app.post('/api/work', async (_request, response) => { enter(); await held; response.json({ ok: true }); });
+	app.get('/api/work', (_request, response) => response.json({ ok: true }));
+	const server = await listen(app);
+	t.after(server.close);
+	const first = fetch(`${server.origin}/api/work`, { method: 'POST' });
+	await entered;
+	const read = await fetch(`${server.origin}/api/work`);
+	assert.equal(read.status, 200);
+	const rejected = await fetch(`${server.origin}/api/work`, { method: 'POST' });
+	assert.equal(rejected.status, 503);
+	assert.equal(rejected.headers.get('retry-after'), '1');
+	release();
+	assert.equal((await first).status, 200);
+	assert.match(await controls.render(), /qase_http_overload_rejections_total 1/);
+});
+test('token usage counters accumulate by kind and mode', async () => {
+	const controls = createOperationalControls({ environment: {} });
+	controls.observeTokens({ kind: 'input', mode: 'qa', value: 1500 });
+	controls.observeTokens({ kind: 'output', mode: 'qa', value: 350 });
+	controls.observeTokens({ kind: 'total', mode: 'qa', value: 1850 });
+	controls.observeTokens({ kind: 'input', mode: 'sqa', value: 100 });
+	controls.observeTokens({ kind: 'input', mode: 'qa', value: 500 });
+	// Invalid observations are ignored, never crash, and never emit garbage.
+	controls.observeTokens({ kind: 'bogus', mode: 'qa', value: 10 });
+	controls.observeTokens({ kind: 'input', mode: 'qa', value: Number.NaN });
+	controls.observeTokens(undefined);
+
+	const metrics = await controls.render();
+	assert.match(metrics, /# HELP qase_model_tokens_total Model tokens consumed by runs, from provider reports or estimates/);
+	assert.match(metrics, /# TYPE qase_model_tokens_total counter/);
+	assert.match(metrics, /qase_model_tokens_total\{kind="input",mode="qa"\} 2000/);
+	assert.match(metrics, /qase_model_tokens_total\{kind="input",mode="sqa"\} 100/);
+	assert.match(metrics, /qase_model_tokens_total\{kind="output",mode="qa"\} 350/);
+	assert.match(metrics, /qase_model_tokens_total\{kind="total",mode="qa"\} 1850/);
+	assert.doesNotMatch(metrics, /bogus/);
+	assert.doesNotMatch(metrics, /NaN/);
+});
+
+test('Drytis source-review mutations share the bounded API concurrency guard', async t => {
+	let release;
+	const held = new Promise(resolve => { release = resolve; });
+	let enter;
+	const entered = new Promise(resolve => { enter = resolve; });
+	const controls = createOperationalControls({ environment: {}, mutationLimit: 1 });
+	const app = express();
+	app.use(controls.middleware);
+	app.post('/internal/v1/drytis/reviews', async (_request, response) => {
+		enter();
+		await held;
+		response.json({ ok: true });
+	});
+	const server = await listen(app);
+	t.after(server.close);
+	const first = fetch(`${server.origin}/internal/v1/drytis/reviews`, { method: 'POST' });
+	await entered;
+	const rejected = await fetch(`${server.origin}/internal/v1/drytis/reviews`, { method: 'POST' });
+	assert.equal(rejected.status, 503);
+	release();
+	assert.equal((await first).status, 200);
+});
+
+test('metrics endpoint is disabled without a token and protected when enabled', async t => {
+	assert.throws(() => createOperationalControls({ metricsToken: 'short' }), /at least 32 bytes/);
+	const controls = createOperationalControls({ metricsToken: TOKEN });
+	const app = express();
+	app.use(controls.middleware);
+	controls.mount(app, { queue: { stats: async () => ({ queued: 7, leased: 2, oldestQueuedAgeSeconds: 11, expiredLeases: 1 }) } });
+	const server = await listen(app);
+	t.after(server.close);
+	assert.equal((await fetch(`${server.origin}/metrics`)).status, 401);
+	const response = await fetch(`${server.origin}/metrics`, { headers: { authorization: `Bearer ${TOKEN}` } });
+	assert.equal(response.status, 200);
+	const body = await response.text();
+	assert.match(body, /qase_execution_jobs\{status="queued"\} 7/);
+	assert.match(body, /qase_execution_oldest_queued_age_seconds 11/);
+});
+
+test('request logs use correlation IDs and normalized routes without raw URLs', async t => {
+	const records = [];
+	const controls = createOperationalControls({ logger: { info: (event, fields) => records.push({ event, fields }) } });
+	const app = express();
+	app.use(controls.middleware);
+	app.get('/api/runs/:id', (_request, response) => response.json({ ok: true }));
+	const server = await listen(app);
+	t.after(server.close);
+	const response = await fetch(`${server.origin}/api/runs/private-run-id`);
+	assert.equal(response.status, 200);
+	assert.equal(records.length, 1);
+	assert.equal(records[0].event, 'http.request.completed');
+	assert.equal(records[0].fields.route, '/api/runs/:id');
+	assert.match(records[0].fields.requestId, /^[0-9a-f-]{36}$/);
+	assert.doesNotMatch(JSON.stringify(records), /private-run-id/);
+});

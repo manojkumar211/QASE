@@ -1,0 +1,1549 @@
+import { createHash, randomUUID } from 'node:crypto';
+import { MAX_FOUNDER_STATE_BYTES, normalizeFounderState } from '../founderService.js';
+import { normalizePendingSqaState } from '../sqaService.js';
+import { currentRequestActor } from '../requestActor.js';
+import { normalizeQaScopeSelection } from '../../public/qaScopeCatalog.js';
+
+/**
+ * PostgreSQL persistence for the current Qase run aggregate.
+ *
+ * The repository is deliberately transport-free: it commits normalized state
+ * and durable run events, but never publishes SSE messages. The application
+ * service may publish only after this transaction has committed.
+ */
+
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const SHA256_PATTERN = /^[0-9a-f]{64}$/;
+const LIFECYCLE_CODE_PATTERN = /^[a-z0-9][a-z0-9_.:-]*$/;
+const LIFECYCLE_REFERENCE_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9_.:/-]*$/;
+const CONTEXT_KEYS = [
+	'organizationId', 'organizationSlug', 'organizationName',
+	'projectId', 'projectSlug', 'projectName',
+	'actorUserId', 'actorEmail', 'actorName', 'actorRole'
+];
+const UNTRUSTED_CONTEXT_KEYS = [
+	'body', 'headers', 'params', 'query', 'request', 'tenant', 'tenantId'
+];
+
+const BEGIN = 'BEGIN';
+const COMMIT = 'COMMIT';
+const ROLLBACK = 'ROLLBACK';
+const ACTOR_TYPES = new Set(['user', 'agent', 'system']);
+const LIFECYCLE_POLICY_VERSION = 'qase-data-lifecycle/v1';
+const DAY_MS = 24 * 60 * 60 * 1000;
+const CHILD_TABLES = Object.freeze({
+	messages: 'qa_messages',
+	activities: 'qa_activities',
+	planItems: 'qa_plan_items',
+	findings: 'qa_findings',
+	reports: 'qa_reports'
+});
+const ALL_CHILD_GROUPS = Object.freeze(Object.keys(CHILD_TABLES));
+const EVENT_CHILD_GROUPS = new Map([
+	['message', Object.freeze(['messages'])],
+	['message_done', Object.freeze(['messages'])],
+	['activity', Object.freeze(['activities'])],
+	['todos', Object.freeze(['planItems'])],
+	['finding', Object.freeze(['findings'])],
+	['finding_status', Object.freeze(['findings'])],
+	['report', Object.freeze(['reports'])],
+	['browser', Object.freeze([])],
+	['context', Object.freeze([])],
+	['usage', Object.freeze([])],
+	['question', Object.freeze([])],
+	['run.recovered', Object.freeze([])],
+	['run.stop_requested', Object.freeze([])],
+	['secrets', Object.freeze([])],
+	['session', Object.freeze([])],
+	['sqa', Object.freeze([])],
+	['sqa.created', Object.freeze([])],
+	['founder.observation', Object.freeze([])],
+	['founder.finalized', Object.freeze([])],
+	['founder.created', Object.freeze([])],
+	['founder.target_bound', Object.freeze([])],
+	['drytis.review.created', Object.freeze([])],
+	['drytis.review.start_requested', Object.freeze([])],
+	['drytis.review.start_completed', Object.freeze([])],
+	['drytis.review.start_failed', Object.freeze([])],
+	['drytis.review.stop_requested', Object.freeze([])],
+	['drytis.review.stopped', Object.freeze([])],
+	['drytis.blackbox.started', Object.freeze([])],
+	['drytis.blackbox.queued', Object.freeze([])],
+	['drytis.blackbox.failed', Object.freeze([])],
+	['drytis.blackbox.settled', Object.freeze([])],
+	['drytis.delivery.requested', Object.freeze([])],
+	['drytis.delivery.completed', Object.freeze([])],
+	['drytis.delivery.failed', Object.freeze([])],
+	['status', Object.freeze([])],
+	['task_complete', Object.freeze([])]
+]);
+
+export class RunVersionConflictError extends Error {
+	constructor(runId, expectedVersion) {
+		super(`Run ${runId} changed after version ${expectedVersion}.`);
+		this.name = 'RunVersionConflictError';
+		this.code = 'QASE_RUN_VERSION_CONFLICT';
+		this.runId = runId;
+		this.expectedVersion = expectedVersion;
+	}
+}
+
+export class TenantInactiveError extends Error {
+	constructor(resource) {
+		super(`The configured Qase ${resource} is not active.`);
+		this.name = 'TenantInactiveError';
+		this.code = 'QASE_TENANT_INACTIVE';
+		this.resource = resource;
+	}
+}
+
+function trustedTenantContext(value) {
+	if (!value || typeof value !== 'object' || !Object.isFrozen(value)) {
+		throw new TypeError('PostgreSQL run storage requires a frozen trusted tenant context.');
+	}
+	for (const key of UNTRUSTED_CONTEXT_KEYS) {
+		if (Object.hasOwn(value, key)) {
+			throw new TypeError('PostgreSQL run storage rejects request-supplied tenant context.');
+		}
+	}
+	for (const key of CONTEXT_KEYS) {
+		if (typeof value[key] !== 'string' || value[key].trim() === '') {
+			throw new TypeError(`Trusted tenant context is missing ${key}.`);
+		}
+	}
+	if (!UUID_PATTERN.test(value.organizationId)
+		|| !UUID_PATTERN.test(value.projectId)
+		|| !UUID_PATTERN.test(value.actorUserId)) {
+		throw new TypeError('Trusted tenant context must contain canonical organization, project and actor UUIDs.');
+	}
+	return Object.freeze(Object.fromEntries(CONTEXT_KEYS.map(key => [key, value[key]])));
+}
+
+function nonNegativeInteger(value, label) {
+	const number = Number(value);
+	if (!Number.isSafeInteger(number) || number < 0) {
+		throw new TypeError(`${label} must be a non-negative safe integer.`);
+	}
+	return number;
+}
+
+function boundedInteger(value, fallback, minimum, maximum, label) {
+	const number = value === undefined ? fallback : Number(value);
+	if (!Number.isSafeInteger(number) || number < minimum || number > maximum) {
+		throw new TypeError(`${label} must be an integer from ${minimum} through ${maximum}.`);
+	}
+	return number;
+}
+
+function lifecycleCode(value, label) {
+	const result = String(value ?? '').trim();
+	if (!result || result.length > 100 || !LIFECYCLE_CODE_PATTERN.test(result)) {
+		throw new TypeError(`${label} must be a bounded machine-readable code.`);
+	}
+	return result;
+}
+
+function lifecycleReference(value) {
+	if (value === undefined || value === null || value === '') return null;
+	const result = String(value).trim();
+	if (result.length > 200 || !LIFECYCLE_REFERENCE_PATTERN.test(result)) {
+		throw new TypeError('referenceId must be a bounded opaque reference.');
+	}
+	return result;
+}
+
+function databaseDate(result, column = 'lifecycle_now') {
+	const value = result?.rows?.[0]?.[column];
+	if (value === undefined || value === null) {
+		throw new Error('PostgreSQL did not return its lifecycle clock.');
+	}
+	return asDate(value);
+}
+
+function count(value) {
+	const result = Number(value ?? 0);
+	if (!Number.isSafeInteger(result) || result < 0) {
+		throw new Error('PostgreSQL returned an invalid lifecycle resource count.');
+	}
+	return result;
+}
+
+function deletionManifest(tenant, runId, resourceCounts) {
+	return createHash('sha256').update(JSON.stringify({
+		version: 1,
+		organizationId: tenant.organizationId,
+		projectId: tenant.projectId,
+		runId,
+		policyVersion: LIFECYCLE_POLICY_VERSION,
+		resourceCounts
+	}), 'utf8').digest('hex');
+}
+
+function requireRun(session) {
+	if (!session || typeof session !== 'object' || typeof session.id !== 'string' || !UUID_PATTERN.test(session.id)) {
+		throw new TypeError('A run aggregate with a canonical UUID is required.');
+	}
+	const mode = session.mode === undefined ? 'qa' : session.mode;
+	if (mode !== 'qa' && mode !== 'sqa' && mode !== 'founder') {
+		throw new TypeError('Run mode must be qa, sqa, or founder.');
+	}
+	if (mode === 'qa' && (session.sqa !== undefined || session.founder !== undefined)) {
+		throw new TypeError('A QA run cannot contain an SQA assessment or Founder review.');
+	}
+	if (mode !== 'qa' && session.drytisIntegration !== undefined) {
+		throw new TypeError('A Drytis integration can only be attached to a QA run.');
+	}
+	if (session.drytisIntegration !== undefined) {
+		if (!session.drytisIntegration || typeof session.drytisIntegration !== 'object'
+			|| Array.isArray(session.drytisIntegration)
+			|| Buffer.byteLength(JSON.stringify(session.drytisIntegration), 'utf8') >= 1_000_000) {
+			throw new TypeError('Drytis integration state must be a bounded JSON object.');
+		}
+	}
+	if (mode === 'sqa') {
+		if (session.founder !== undefined) {
+			throw new TypeError('An SQA run cannot contain a Founder review.');
+		}
+		if (!session.sqa || typeof session.sqa !== 'object' || Array.isArray(session.sqa)) {
+			throw new TypeError('An SQA run requires an SQA assessment object.');
+		}
+		const profiles = session.sqa?.scope?.profiles;
+		if (!Array.isArray(profiles) || profiles.length < 1 || profiles.length > 16
+			|| profiles.some(profile => typeof profile !== 'string' || !profile.trim())) {
+			throw new TypeError('An SQA run requires one through sixteen profile identifiers.');
+		}
+		if (Buffer.byteLength(JSON.stringify(session.sqa), 'utf8') > 1_000_000) {
+			throw new TypeError('The SQA assessment exceeds the one-megabyte storage limit.');
+		}
+	}
+	if (mode === 'founder') {
+		if (session.sqa !== undefined) {
+			throw new TypeError('A Founder run cannot contain an SQA assessment.');
+		}
+		if (!session.founder || typeof session.founder !== 'object' || Array.isArray(session.founder)) {
+			throw new TypeError('A Founder run requires a Founder review object.');
+		}
+		if (Buffer.byteLength(JSON.stringify(session.founder), 'utf8') >= MAX_FOUNDER_STATE_BYTES) {
+			throw new TypeError('The Founder review exceeds the one-megabyte storage limit.');
+		}
+	}
+	return session;
+}
+
+function runMode(session) {
+	return session.mode === 'sqa' || session.mode === 'founder' ? session.mode : 'qa';
+}
+
+/**
+ * Engine normalization for persistence. Defense in depth: unknown values
+ * (including rows written before migration 014 existed, or by other
+ * writers) fall back to the historical default rather than poisoning the
+ * session handed to the agent.
+ *
+ * NOTE: this allowlist intentionally duplicates ENGINE_IDS from
+ * browserEngines.js rather than importing it, keeping the persistence
+ * layer transport/launcher-free. When a new engine id is added to
+ * ENGINE_IDS, add it here too — otherwise Postgres persistence will
+ * silently coerce it to chromium while the local store keeps it (the
+ * exact parity class this migration fixed).
+ */
+function runEngine(session) {
+	return session?.engine === 'firefox' || session?.engine === 'webkit' ? session.engine : 'chromium';
+}
+
+function runDevice(session) {
+	return typeof session?.device === 'string' && session.device ? session.device : 'desktop';
+}
+
+/** Analytics cohort ('pilot' or NULL) — read by the run_started/run_finished hooks. */
+function runCohort(session) {
+	return session?.cohort === 'pilot' ? 'pilot' : null;
+}
+
+/** Persisted QA coverage selection (whitelisted array) or NULL for legacy runs. */
+function scopeSelectionJson(session) {
+	const normalized = normalizeQaScopeSelection(session?.scopeSelection);
+	return Array.isArray(normalized) ? JSON.stringify(normalized) : null;
+}
+
+/** Server-authoritative timing columns, hydrated into the run aggregate. */
+const TIMING_COLUMNS = `started_at, completed_at, queued_at, setup_started_at, setup_ended_at,
+	report_started_at, report_ended_at, cancelled_at, paused_at, paused_seconds, failure_reason`;
+
+function optionalDate(target, key, value) {
+	optional(target, key, value === null || value === undefined ? undefined : epoch(value));
+	return target;
+}
+
+/** Attach timing fields (epoch ms) from a qa_runs row to a hydrated session. */
+function hydrateTiming(target, row) {
+	optionalDate(target, 'startedAt', row.started_at);
+	optionalDate(target, 'completedAt', row.completed_at);
+	optionalDate(target, 'queuedAt', row.queued_at);
+	optionalDate(target, 'setupStartedAt', row.setup_started_at);
+	optionalDate(target, 'setupEndedAt', row.setup_ended_at);
+	optionalDate(target, 'reportStartedAt', row.report_started_at);
+	optionalDate(target, 'reportEndedAt', row.report_ended_at);
+	optionalDate(target, 'cancelledAt', row.cancelled_at);
+	optionalDate(target, 'pausedAt', row.paused_at);
+	optional(target, 'pausedSeconds', row.paused_seconds === null || row.paused_seconds === undefined
+		? undefined
+		: Number(row.paused_seconds));
+	optional(target, 'failureReason', row.failure_reason ?? undefined);
+	return target;
+}
+
+/**
+ * Column expressions for phase durations (seconds, server-computed).
+ * `queue` is only meaningful between enqueue and start; total duration needs
+ * both endpoints, otherwise the run is still in flight.
+ */
+function timingSelect(alias = '') {
+	const a = alias;
+	// duration_seconds is active execution time: total span minus accumulated
+	// paused intervals. A currently-paused run (paused_at set, no completion)
+	// is measured up to the pause point.
+	return `CASE
+			WHEN ${a}completed_at IS NOT NULL AND ${a}started_at IS NOT NULL
+				THEN GREATEST(0, EXTRACT(EPOCH FROM (${a}completed_at - ${a}started_at)) - COALESCE(${a}paused_seconds, 0))
+			WHEN ${a}paused_at IS NOT NULL AND ${a}started_at IS NOT NULL
+				THEN GREATEST(0, EXTRACT(EPOCH FROM (${a}paused_at - ${a}started_at)) - COALESCE(${a}paused_seconds, 0))
+		END AS duration_seconds,
+		COALESCE(${a}paused_seconds, 0) AS paused_seconds,
+		CASE WHEN ${a}started_at IS NOT NULL AND ${a}queued_at IS NOT NULL
+			THEN EXTRACT(EPOCH FROM (${a}started_at - ${a}queued_at)) END AS queue_duration_seconds,
+		CASE WHEN ${a}setup_started_at IS NOT NULL AND ${a}setup_ended_at IS NOT NULL
+			THEN EXTRACT(EPOCH FROM (${a}setup_ended_at - ${a}setup_started_at)) END AS setup_duration_seconds,
+		CASE WHEN ${a}report_started_at IS NOT NULL AND ${a}report_ended_at IS NOT NULL
+			THEN EXTRACT(EPOCH FROM (${a}report_ended_at - ${a}report_started_at)) END AS report_duration_seconds`;
+}
+
+function readTiming(row) {
+	const read = value => (value === null || value === undefined ? undefined : Number(value));
+	const pausedSeconds = row.paused_seconds === null || row.paused_seconds === undefined ? 0 : Number(row.paused_seconds);
+	// Active duration excludes paused intervals; a currently-paused run is
+	// frozen at its pause point.
+	const rawEnd = row.completed_at
+		?? row.paused_at
+		?? null;
+	const active = rawEnd && row.started_at
+		? Math.max(0, (epoch(rawEnd) - epoch(row.started_at)) / 1000 - pausedSeconds)
+		: undefined;
+	return {
+		durationSeconds: active,
+		pausedSeconds,
+		queueDurationSeconds: read(row.queue_duration_seconds),
+		setupDurationSeconds: read(row.setup_duration_seconds),
+		reportDurationSeconds: read(row.report_duration_seconds),
+		// The rest of the elapsed time between setup end and report start is
+		// the actual test execution phase.
+		executionDurationSeconds: row.setup_ended_at && row.report_started_at
+			? Math.max(0, (epoch(row.report_started_at) - epoch(row.setup_ended_at)) / 1000)
+				: row.setup_ended_at && rawEnd
+					? Math.max(0, (epoch(rawEnd) - epoch(row.setup_ended_at)) / 1000)
+					: undefined
+	};
+}
+
+function sqaProfiles(session) {
+	if (runMode(session) !== 'sqa') return [];
+	return [...new Set(session.sqa.scope.profiles.map(profile => profile.trim()))];
+}
+
+function asDate(value, fallback) {
+	if (value === undefined || value === null) return new Date(fallback);
+	const result = value instanceof Date ? new Date(value.getTime()) : new Date(value);
+	if (Number.isNaN(result.getTime())) {
+		throw new TypeError('Run timestamps must be valid dates or epoch values.');
+	}
+	return result;
+}
+
+function asNullableDate(value) {
+	if (value === undefined || value === null) return null;
+	const result = value instanceof Date ? new Date(value.getTime()) : new Date(value);
+	if (Number.isNaN(result.getTime())) {
+		throw new TypeError('Run timestamps must be valid dates or epoch values.');
+	}
+	return result;
+}
+
+function epoch(value) {
+	if (value === undefined || value === null) return undefined;
+	if (value instanceof Date) return value.getTime();
+	if (typeof value === 'number') return value;
+	const numeric = Number(value);
+	if (Number.isFinite(numeric) && String(value).trim() !== '') return numeric;
+	const parsed = Date.parse(value);
+	return Number.isNaN(parsed) ? undefined : parsed;
+}
+
+function optional(target, key, value) {
+	if (value !== undefined && value !== null) target[key] = value;
+	return target;
+}
+
+function json(value) {
+	return value === undefined ? null : value;
+}
+
+function names(value) {
+	if (!Array.isArray(value)) return [];
+	return value
+		.filter(name => typeof name === 'string' && name.trim() !== '')
+		.map(name => name.trim());
+}
+
+function eventOptions(options, fallbackDate, tenant) {
+	const type = options?.eventType;
+	if (type !== undefined && (typeof type !== 'string' || type.trim() === '')) {
+		throw new TypeError('eventType must be a non-empty string when supplied.');
+	}
+	const actorType = options?.actorType ?? 'system';
+	if (!ACTOR_TYPES.has(actorType)) {
+		throw new TypeError('actorType must be user, agent, or system.');
+	}
+	let actorUserId = null;
+	if (actorType === 'user') {
+		actorUserId = options?.actorUserId ?? tenant.actorUserId;
+		if (typeof actorUserId !== 'string' || !UUID_PATTERN.test(actorUserId)) {
+			throw new TypeError('User event attribution requires a trusted canonical actor UUID.');
+		}
+	} else if (options?.actorUserId !== undefined && options.actorUserId !== null) {
+		// The schema intentionally forbids a user identity on agent/system events.
+		throw new TypeError('Agent and system events cannot carry a user actor ID.');
+	}
+	return {
+		type: type?.trim(),
+		payload: json(options?.payload ?? {}),
+		createdAt: asDate(options?.eventTs, fallbackDate),
+		actorType,
+		actorUserId
+	};
+}
+
+async function setTenantContext(client, tenant) {
+	await client.query(
+		"SELECT set_config('qase.organization_id', $1, true), set_config('qase.project_id', $2, true)",
+		[tenant.organizationId, tenant.projectId]
+	);
+}
+
+function groupByRun(rows) {
+	const grouped = new Map();
+	for (const row of rows ?? []) {
+		let entries = grouped.get(row.run_id);
+		if (!entries) {
+			entries = [];
+			grouped.set(row.run_id, entries);
+		}
+		entries.push(row);
+	}
+	return grouped;
+}
+
+function hydrateMessage(row) {
+	return optional({
+		id: row.id,
+		ts: epoch(row.created_at),
+		role: row.role,
+		text: row.content ?? ''
+	}, 'kind', row.kind);
+}
+
+function hydrateActivity(row) {
+	const activity = { id: row.id, ts: epoch(row.created_at), status: row.status };
+	optional(activity, 'type', row.type);
+	optional(activity, 'toolName', row.tool_name);
+	optional(activity, 'label', row.label);
+	optional(activity, 'detail', row.detail);
+	optional(activity, 'input', row.input);
+	optional(activity, 'error', row.error);
+	optional(activity, 'summary', row.summary);
+	return activity;
+}
+
+function hydrateFinding(row) {
+	const finding = {
+		id: row.id,
+		ts: epoch(row.created_at),
+		title: row.title,
+		severity: row.severity,
+		category: row.category,
+		steps: row.steps ?? [],
+		expected: row.expected,
+		actual: row.actual
+	};
+	optional(finding, 'url', row.page_url);
+	optional(finding, 'evidence', row.evidence);
+	// Lifecycle tracking columns (migration 015); rows written before it read
+	// back as the default `open` state.
+	finding.status = row.status ?? 'open';
+	finding.statusTs = row.status_at !== null && row.status_at !== undefined && Number.isFinite(Number(row.status_at))
+		? Number(row.status_at)
+		: finding.ts;
+	finding.statusNote = row.status_note ?? '';
+	return finding;
+}
+
+function hydrateReport(row) {
+	if (!row) return undefined;
+	return {
+		ts: epoch(row.published_at),
+		verdict: row.verdict,
+		summary: row.summary,
+		covered: row.covered ?? [],
+		notCovered: row.not_covered ?? [],
+		recommendations: row.recommendations ?? [],
+		targetUrl: row.target_url ?? undefined,
+		findings: Number(row.finding_count ?? 0),
+		bySeverity: row.severity_counts ?? {}
+	};
+}
+
+function hydrateRun(row, children) {
+	const session = {
+		id: row.id,
+		title: row.title,
+		createdAt: epoch(row.created_at),
+		updatedAt: epoch(row.updated_at),
+		status: row.status,
+		mode: row.run_mode === 'sqa' || row.run_mode === 'founder' ? row.run_mode : 'qa',
+		targetUrl: row.target_url ?? undefined,
+		engine: runEngine({ engine: row.engine }),
+		device: runDevice({ device: row.device }),
+		deviceLandscape: row.device_landscape === true,
+		cohort: row.cohort === 'pilot' ? 'pilot' : undefined,
+		scopeSelection: normalizeQaScopeSelection(row.scope_selection) ?? undefined,
+		messages: (children.messages.get(row.id) ?? []).map(hydrateMessage),
+		activities: (children.activities.get(row.id) ?? []).map(hydrateActivity),
+		findings: (children.findings.get(row.id) ?? []).map(hydrateFinding),
+		todos: (children.planItems.get(row.id) ?? []).map(item => ({ text: item.text, status: item.status })),
+		report: hydrateReport(children.reports.get(row.id)?.[0]),
+		pendingQuestion: row.pending_question ?? undefined,
+		contextUsage: row.context_usage ?? undefined,
+		feedback: row.feedback ?? undefined,
+		runStartedAt: epoch(row.started_at) || undefined,
+		runCompletedAt: epoch(row.completed_at) || undefined,
+		tokenUsage: row.token_usage ?? undefined,
+		environmentId: row.environment_id ?? undefined,
+		environmentSnapshot: row.environment_snapshot ?? undefined,
+		executionLevel: row.execution_level_actual ?? undefined,
+		executionProviderActual: row.execution_provider_actual ?? undefined,
+		runtimeFacts: row.runtime_facts ?? undefined,
+		testCaseId: row.test_case_id ?? undefined,
+		matrixRunId: row.matrix_run_id ?? undefined,
+		secretNames: names(row.secret_names),
+		selectedTests: row.selected_tests?.length ? [...row.selected_tests] : undefined,
+		securityAuthorization: row.security_authorization ?? undefined,
+		ownerUserId: row.created_by_user_id ?? undefined
+	};
+	if (session.mode === 'sqa') {
+		session.sqa = normalizePendingSqaState(row.sqa_assessment ?? {
+			scope: { profiles: names(row.sqa_profiles) }
+		});
+	}
+	if (session.mode === 'founder') {
+		session.founder = normalizeFounderState(row.founder_assessment);
+	}
+	if (row.drytis_integration !== undefined && row.drytis_integration !== null) {
+		session.drytisIntegration = row.drytis_integration;
+	}
+	hydrateTiming(session, row);
+	Object.assign(session, readTiming(row));
+	return { session, version: Number(row.lock_version) };
+}
+
+async function hydrateRows(client, tenant, runRows) {
+	if (!runRows?.length) return [];
+	const ids = runRows.map(row => row.id);
+	const childScope = [tenant.organizationId, tenant.projectId, ids];
+	const [messages, activities, planItems, findings, reports] = await Promise.all([
+		client.query(
+			`SELECT run_id, id, role, kind, content, actor_user_id, created_at
+			 FROM qa_messages
+			 WHERE organization_id = $1 AND project_id = $2 AND run_id = ANY($3::uuid[])
+			 ORDER BY run_id, ordinal`, childScope),
+		client.query(
+			`SELECT run_id, id, type, tool_name, label, detail, input, status, error, summary, created_at
+			 FROM qa_activities
+			 WHERE organization_id = $1 AND project_id = $2 AND run_id = ANY($3::uuid[])
+			 ORDER BY run_id, ordinal`, childScope),
+		client.query(
+			`SELECT run_id, position, text, status
+			 FROM qa_plan_items
+			 WHERE organization_id = $1 AND project_id = $2 AND run_id = ANY($3::uuid[])
+			 ORDER BY run_id, position`, childScope),
+		client.query(
+			`SELECT run_id, id, title, severity, category, page_url, steps, expected, actual, evidence,
+				status, status_note, status_at, created_at
+			 FROM qa_findings
+			 WHERE organization_id = $1 AND project_id = $2 AND run_id = ANY($3::uuid[])
+			 ORDER BY run_id, ordinal`, childScope),
+		client.query(
+			`SELECT run_id, verdict, summary, covered, not_covered, recommendations,
+				target_url, finding_count, severity_counts, published_at
+			 FROM qa_reports
+			 WHERE organization_id = $1 AND project_id = $2 AND run_id = ANY($3::uuid[])
+				AND is_current = true
+			 ORDER BY run_id`, childScope)
+	]);
+	const children = {
+		messages: groupByRun(messages.rows),
+		activities: groupByRun(activities.rows),
+		planItems: groupByRun(planItems.rows),
+		findings: groupByRun(findings.rows),
+		reports: groupByRun(reports.rows)
+	};
+	return runRows.map(row => hydrateRun(row, children));
+}
+
+function childGroupsForEvent(eventType) {
+	// Unknown or eventless repository callers retain the legacy full-aggregate
+	// behavior. Only established application events use the selective fast path.
+	return EVENT_CHILD_GROUPS.get(eventType) ?? ALL_CHILD_GROUPS;
+}
+
+async function replaceChildren(client, tenant, session, fallbackDate, groups = ALL_CHILD_GROUPS) {
+	const scope = [tenant.organizationId, tenant.projectId, session.id];
+	const selected = new Set(groups);
+	for (const group of selected) {
+		const table = CHILD_TABLES[group];
+		if (!table) throw new TypeError(`Unknown run child group: ${group}.`);
+		await client.query(
+			`DELETE FROM ${table} WHERE organization_id = $1 AND project_id = $2 AND run_id = $3`,
+			scope
+		);
+	}
+
+	for (const [ordinal, message] of (selected.has('messages') ? session.messages ?? [] : []).entries()) {
+		await client.query(
+			`INSERT INTO qa_messages (
+				organization_id, project_id, run_id, id, ordinal, role, kind, content,
+				actor_user_id, created_at, updated_at
+			) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$10)`,
+			[
+				...scope, message.id, ordinal, message.role, message.kind ?? null,
+				String(message.text ?? ''), message.actorUserId ?? null,
+				asDate(message.ts, fallbackDate)
+			]
+		);
+	}
+
+	for (const [ordinal, activity] of (selected.has('activities') ? session.activities ?? [] : []).entries()) {
+		await client.query(
+			`INSERT INTO qa_activities (
+				organization_id, project_id, run_id, id, ordinal, type, tool_name, label,
+				detail, input, status, error, summary, created_at, updated_at
+			) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$14)`,
+			[
+				...scope, activity.id, ordinal, activity.type ?? null,
+				activity.toolName ?? null,
+				String(activity.label ?? activity.toolName ?? activity.type ?? 'Activity'),
+				activity.detail ?? null,
+				json(activity.input), activity.status ?? 'done', activity.error ?? null,
+				activity.summary ?? null, asDate(activity.ts, fallbackDate)
+			]
+		);
+	}
+
+	for (const [position, item] of (selected.has('planItems') ? session.todos ?? [] : []).entries()) {
+		const itemId = typeof item.id === 'string' && UUID_PATTERN.test(item.id) ? item.id : randomUUID();
+		await client.query(
+			`INSERT INTO qa_plan_items (
+				organization_id, project_id, run_id, id, position, text, status
+			) VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+			[...scope, itemId, position, String(item.text ?? ''), item.status ?? 'pending']
+		);
+	}
+
+	for (const [ordinal, finding] of (selected.has('findings') ? session.findings ?? [] : []).entries()) {
+		await client.query(
+			`INSERT INTO qa_findings (
+				organization_id, project_id, run_id, id, ordinal, title, severity,
+				category, page_url, steps, expected, actual, evidence,
+				status, status_note, status_at, created_at
+			) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)`,
+			[
+				...scope, finding.id, ordinal, String(finding.title ?? ''),
+				finding.severity ?? 'medium', finding.category ?? 'general',
+				finding.url ?? null, Array.isArray(finding.steps) ? finding.steps.map(String) : [],
+				String(finding.expected ?? ''), String(finding.actual ?? ''),
+				finding.evidence ?? null,
+				finding.status ?? 'open',
+				typeof finding.statusNote === 'string' && finding.statusNote.trim() ? finding.statusNote.trim().slice(0, 500) : null,
+				Number.isFinite(finding.statusTs) ? finding.statusTs : null,
+				asDate(finding.ts, fallbackDate)
+			]
+		);
+	}
+
+	if (selected.has('reports') && session.report) {
+		const report = session.report;
+		await client.query(
+			`INSERT INTO qa_reports (
+				organization_id, project_id, run_id, id, version, is_current, verdict,
+				summary, covered, not_covered, recommendations, target_url,
+				finding_count, severity_counts, published_at
+			) VALUES ($1,$2,$3,$4,1,true,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
+			[
+				...scope, session.id, report.verdict ?? 'pass_with_issues',
+				String(report.summary ?? ''), Array.isArray(report.covered) ? report.covered.map(String) : [],
+				Array.isArray(report.notCovered) ? report.notCovered.map(String) : [],
+				Array.isArray(report.recommendations) ? report.recommendations.map(String) : [],
+				report.targetUrl ?? session.targetUrl ?? null,
+				Number(report.findings ?? session.findings?.length ?? 0), json(report.bySeverity ?? {}),
+				asDate(report.ts, fallbackDate)
+			]
+		);
+	}
+}
+
+async function appendEvent(client, tenant, runId, sequence, event, createdAt) {
+	if (!event.type) return;
+	await client.query(
+		`INSERT INTO qa_run_events (
+			organization_id, project_id, run_id, sequence, event_type, payload_version,
+			payload, actor_type, actor_user_id, created_at
+		) VALUES ($1,$2,$3,$4,$5,1,$6,$7,$8,$9)`,
+		[
+			tenant.organizationId, tenant.projectId, runId, sequence,
+			event.type, event.payload, event.actorType, event.actorUserId, createdAt
+		]
+	);
+}
+
+	async function insertAggregate(client, tenant, session, event, nowValue) {
+	const updatedAt = asDate(session.updatedAt, nowValue);
+	const createdAt = asDate(session.createdAt, updatedAt);
+	const nextEventSequence = event.type ? 2 : 1;
+	const result = await client.query(
+		`INSERT INTO qa_runs (
+			id, organization_id, project_id, created_by_user_id, title, target_url,
+			status, status_detail, run_mode, sqa_profiles, sqa_assessment, founder_assessment,
+			drytis_integration, pending_question, context_usage, token_usage, secret_names,
+			message_count, finding_count, lock_version, next_event_sequence,
+			engine, device, device_landscape, cohort, scope_selection,
+			created_at, updated_at, queued_at, paused_at, selected_tests, security_authorization,
+			environment_id, environment_snapshot, test_case_id,
+			execution_level_actual, execution_provider_actual, runtime_facts, matrix_run_id
+		) VALUES ($1,$2,$3,$4,$5,$6,$7,NULL,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,0,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,$37)
+			RETURNING lock_version, updated_at`,
+		[
+			session.id, tenant.organizationId, tenant.projectId, session.ownerUserId ?? event.actorUserId ?? tenant.actorUserId,
+			String(session.title ?? 'New test run'), session.targetUrl ?? null,
+			session.status ?? 'idle', runMode(session), sqaProfiles(session),
+			runMode(session) === 'sqa' ? json(session.sqa) : null,
+			runMode(session) === 'founder' ? json(session.founder) : null,
+			json(session.drytisIntegration), json(session.pendingQuestion), json(session.contextUsage),
+			json(session.tokenUsage), names(session.secretNames),
+			session.messages?.length ?? 0, session.findings?.length ?? 0,
+			nextEventSequence,
+			runEngine(session), runDevice(session), session.deviceLandscape === true,
+			runCohort(session),
+			scopeSelectionJson(session),
+			createdAt, updatedAt,
+			asNullableDate(session.queuedAt),
+			asNullableDate(session.pausedAt),
+			session.selectedTests?.length ? [...session.selectedTests] : null,
+			session.securityAuthorization ? json(session.securityAuthorization) : null,
+			session.environmentId ?? null,
+			json(session.environmentSnapshot),
+			session.testCaseId ?? null,
+			session.executionLevel ?? session.executionLevelActual ?? null,
+			session.executionProviderActual ?? null,
+			json(session.runtimeFacts ?? null),
+			session.matrixRunId ?? null
+		]
+	);
+	await replaceChildren(client, tenant, session, updatedAt);
+	await appendEvent(client, tenant, session.id, 1, event, event.createdAt);
+	return {
+		version: Number(result.rows[0].lock_version),
+		updatedAt: epoch(result.rows[0].updated_at)
+	};
+}
+
+export function createPostgresRunRepository({
+	pool,
+	tenantContext,
+	now = () => Date.now(),
+	runRetentionDays
+} = {}) {
+	if (!pool || typeof pool.connect !== 'function' || typeof pool.end !== 'function') {
+		throw new TypeError('A PostgreSQL pool with connect() and end() is required.');
+	}
+	if (typeof now !== 'function') {
+		throw new TypeError('now must be a function.');
+	}
+	const tenant = trustedTenantContext(tenantContext);
+	const retentionDays = boundedInteger(runRetentionDays, 30, 1, 3650, 'runRetentionDays');
+	let closePromise;
+
+	async function transaction(work) {
+		const client = await pool.connect();
+		let began = false;
+		try {
+			await client.query(BEGIN);
+			began = true;
+			await setTenantContext(client, tenant);
+			const result = await work(client);
+			await client.query(COMMIT);
+			return result;
+		} catch (error) {
+			if (began) {
+				try {
+					await client.query(ROLLBACK);
+				} catch {
+					// Preserve the operation error; a poisoned connection is released below.
+				}
+			}
+			throw error;
+		} finally {
+			client.release();
+		}
+	}
+
+	async function bootstrapTenant() {
+		return transaction(async client => {
+			const timestamp = asDate(now(), Date.now());
+			const organization = await client.query(
+				`INSERT INTO organizations (id, slug, name, status, created_at, updated_at)
+				 VALUES ($1,$2,$3,'active',$4,$4)
+				 ON CONFLICT (id) DO UPDATE SET
+					slug = EXCLUDED.slug, name = EXCLUDED.name, updated_at = EXCLUDED.updated_at
+				 WHERE organizations.status = 'active'
+				 RETURNING status`,
+				[tenant.organizationId, tenant.organizationSlug, tenant.organizationName, timestamp]
+			);
+			if (organization.rows?.[0]?.status !== 'active') throw new TenantInactiveError('organization');
+			const user = await client.query(
+				`INSERT INTO users (
+					id, email, normalized_email, display_name, status, created_at, updated_at
+				) VALUES ($1,$2,$3,$4,'active',$5,$5)
+				 ON CONFLICT (id) DO UPDATE SET
+					email = EXCLUDED.email, normalized_email = EXCLUDED.normalized_email,
+					display_name = EXCLUDED.display_name, updated_at = EXCLUDED.updated_at
+				 WHERE users.status = 'active'
+				 RETURNING status`,
+				[
+					tenant.actorUserId, tenant.actorEmail,
+					tenant.actorEmail.trim().toLowerCase(), tenant.actorName, timestamp
+				]
+			);
+			if (user.rows?.[0]?.status !== 'active') throw new TenantInactiveError('user');
+			const membership = await client.query(
+				`INSERT INTO organization_memberships (
+					organization_id, user_id, role, status, created_at, updated_at
+				) VALUES ($1,$2,$3,'active',$4,$4)
+				 ON CONFLICT (organization_id, user_id) DO UPDATE SET
+					role = EXCLUDED.role, updated_at = EXCLUDED.updated_at
+				 WHERE organization_memberships.status = 'active'
+				 RETURNING status`,
+				[tenant.organizationId, tenant.actorUserId, tenant.actorRole, timestamp]
+			);
+			if (membership.rows?.[0]?.status !== 'active') throw new TenantInactiveError('membership');
+			const project = await client.query(
+				`INSERT INTO projects (id, organization_id, slug, name, status, created_at, updated_at)
+				 VALUES ($1,$2,$3,$4,'active',$5,$5)
+				 ON CONFLICT (id) DO UPDATE SET
+					slug = EXCLUDED.slug, name = EXCLUDED.name, updated_at = EXCLUDED.updated_at
+				 WHERE projects.status = 'active'
+				 RETURNING status`,
+				[tenant.projectId, tenant.organizationId, tenant.projectSlug, tenant.projectName, timestamp]
+			);
+			if (project.rows?.[0]?.status !== 'active') throw new TenantInactiveError('project');
+			return {
+				ready: true,
+				organizationId: tenant.organizationId,
+				projectId: tenant.projectId,
+				actorUserId: tenant.actorUserId
+			};
+		});
+	}
+
+	async function loadAll() {
+		return transaction(async client => {
+			const scope = [tenant.organizationId, tenant.projectId];
+			const runs = await client.query(
+				`SELECT id, created_by_user_id, title, target_url, status, run_mode, sqa_profiles, sqa_assessment, founder_assessment, drytis_integration,
+					pending_question, context_usage, token_usage, secret_names, engine, device, device_landscape, cohort, selected_tests, security_authorization, scope_selection, created_at, updated_at, lock_version,
+					environment_id, environment_snapshot, test_case_id, execution_level_actual, execution_provider_actual, runtime_facts, matrix_run_id, ${TIMING_COLUMNS}
+				 FROM qa_runs
+				 WHERE organization_id = $1 AND project_id = $2 AND deleted_at IS NULL
+				 ORDER BY updated_at DESC, id ASC`,
+				scope
+			);
+			return hydrateRows(client, tenant, runs.rows);
+		});
+	}
+
+	async function get(runId) {
+		if (typeof runId !== 'string' || !UUID_PATTERN.test(runId)) {
+			throw new TypeError('Run ID must be a canonical UUID.');
+		}
+		return transaction(async client => {
+			const result = await client.query(
+				`SELECT id, created_by_user_id, title, target_url, status, run_mode, sqa_profiles, sqa_assessment, founder_assessment, drytis_integration,
+					pending_question, context_usage, token_usage, secret_names, engine, device, device_landscape, cohort, selected_tests, security_authorization, scope_selection, created_at, updated_at, lock_version,
+					environment_id, environment_snapshot, test_case_id, execution_level_actual, execution_provider_actual, runtime_facts, matrix_run_id, ${TIMING_COLUMNS}
+				 FROM qa_runs
+				 WHERE organization_id = $1 AND project_id = $2 AND id = $3
+					AND deleted_at IS NULL
+					AND ($4::uuid IS NULL OR created_by_user_id = $4)`,
+				[tenant.organizationId, tenant.projectId, runId, currentRequestActor()?.actorUserId ?? null]
+			);
+			const hydrated = await hydrateRows(client, tenant, result.rows);
+			return hydrated[0];
+		});
+	}
+
+	async function list(options = {}) {
+		const limit = boundedInteger(options.limit, 100, 1, 100, 'limit');
+		return transaction(async client => {
+			const result = await client.query(
+				`SELECT id, title, status, run_mode, target_url, engine, device, device_landscape, cohort, scope_selection, created_at, updated_at,
+					message_count, finding_count, token_usage, environment_id, environment_snapshot, test_case_id, execution_level_actual, execution_provider_actual, runtime_facts, matrix_run_id, ${TIMING_COLUMNS}, ${timingSelect()},
+					(SELECT verdict FROM qa_reports
+						WHERE organization_id = $1 AND project_id = $2 AND run_id = qa_runs.id AND is_current = true
+						LIMIT 1) AS report_verdict,
+					(SELECT COUNT(*)::int FROM qa_plan_items
+						WHERE organization_id = $1 AND project_id = $2 AND run_id = id) AS todo_total,
+					(SELECT COUNT(*)::int FROM qa_plan_items
+						WHERE organization_id = $1 AND project_id = $2 AND run_id = id
+					AND status = 'completed') AS todo_completed
+					FROM qa_runs
+					WHERE organization_id = $1 AND project_id = $2 AND deleted_at IS NULL
+					AND ($4::uuid IS NULL OR created_by_user_id = $4)
+					ORDER BY updated_at DESC, id ASC
+					LIMIT $3`,
+				[tenant.organizationId, tenant.projectId, limit, currentRequestActor()?.actorUserId ?? null]
+			);
+			return (result.rows ?? []).map(row => ({
+				id: row.id,
+				title: row.title,
+				status: row.status,
+				mode: row.run_mode === 'sqa' || row.run_mode === 'founder' ? row.run_mode : 'qa',
+				targetUrl: row.target_url ?? undefined,
+				engine: runEngine({ engine: row.engine }),
+				device: runDevice({ device: row.device }),
+				deviceLandscape: row.device_landscape === true,
+				createdAt: epoch(row.created_at),
+				updatedAt: epoch(row.updated_at),
+				startedAt: row.started_at ? epoch(row.started_at) : undefined,
+				completedAt: row.completed_at ? epoch(row.completed_at) : undefined,
+				pausedAt: row.paused_at ? epoch(row.paused_at) : undefined,
+				...readTiming(row),
+				findingCount: Number(row.finding_count ?? 0),
+				messageCount: Number(row.message_count ?? 0),
+				...(row.report_verdict ? { reportVerdict: row.report_verdict } : {}),
+				// Plan progress for the sidebar card — derived from the child table.
+				todoTotal: Number(row.todo_total ?? 0),
+				todoCompleted: Number(row.todo_completed ?? 0),
+				tokenUsage: row.token_usage ?? undefined,
+				executionLevel: row.execution_level_actual ?? undefined,
+				executionProviderActual: row.execution_provider_actual ?? undefined,
+				runtimeFacts: row.runtime_facts ?? undefined
+			}));
+		});
+	}
+
+	async function create(session, options = {}) {
+		requireRun(session);
+		return transaction(async client => {
+			const timestamp = now();
+			return insertAggregate(client, tenant, session, eventOptions(options, timestamp, tenant), timestamp);
+		});
+	}
+
+	async function importBatch({ sourceHash, sourcePath, importerVersion, runs } = {}) {
+		for (const [label, value] of Object.entries({ sourceHash, sourcePath, importerVersion })) {
+			if (typeof value !== 'string' || value.trim() === '') {
+				throw new TypeError(`${label} must be a non-empty string.`);
+			}
+		}
+		if (!SHA256_PATTERN.test(sourceHash.trim())) {
+			throw new TypeError('sourceHash must be a lowercase SHA-256 digest.');
+		}
+		if (!Array.isArray(runs)) {
+			throw new TypeError('runs must be an array.');
+		}
+		const ids = new Set();
+		for (const run of runs) {
+			requireRun(run);
+			if (ids.has(run.id)) {
+				throw new TypeError(`Legacy import contains duplicate run ID ${run.id}.`);
+			}
+			ids.add(run.id);
+		}
+
+		return transaction(async client => {
+			await client.query(
+				'SELECT pg_advisory_xact_lock(hashtextextended($1, 0)) AS locked',
+				[`${tenant.organizationId}:${tenant.projectId}:${sourceHash.trim()}`]
+			);
+			const marker = await client.query(
+				`SELECT counts FROM qa_legacy_imports
+				 WHERE source_kind = 'sessions_json' AND source_sha256 = $1
+					AND organization_id = $2 AND project_id = $3`,
+				[sourceHash.trim(), tenant.organizationId, tenant.projectId]
+			);
+			if (marker.rows?.length) {
+				return { alreadyImported: true, imported: 0 };
+			}
+
+			if (runs.length > 0) {
+				const collisions = await client.query(
+					`SELECT id FROM qa_runs
+					 WHERE organization_id = $1 AND project_id = $2 AND id = ANY($3::uuid[])`,
+					[tenant.organizationId, tenant.projectId, [...ids]]
+				);
+				if (collisions.rows?.length) {
+					const error = new Error(`Legacy run ID already exists: ${collisions.rows[0].id}.`);
+					error.code = 'QASE_LEGACY_RUN_COLLISION';
+					throw error;
+				}
+			}
+
+			const importedAt = asDate(now(), Date.now());
+			for (const run of runs) {
+				await insertAggregate(client, tenant, run, {
+					type: 'legacy.run_imported',
+					payload: { sourceHash: sourceHash.trim() },
+					createdAt: asDate(run.updatedAt, importedAt),
+					actorType: 'system',
+					actorUserId: null
+				}, importedAt);
+			}
+
+			await client.query(
+				`INSERT INTO qa_legacy_imports (
+					id, organization_id, project_id, imported_by_user_id,
+					source_kind, source_sha256, source_label, counts, imported_at
+				) VALUES ($1,$2,$3,$4,'sessions_json',$5,'legacy sessions import',$6,$7)`,
+				[
+					randomUUID(), tenant.organizationId, tenant.projectId, tenant.actorUserId,
+					sourceHash.trim(), { runCount: runs.length, importerVersion: importerVersion.trim() }, importedAt
+				]
+			);
+			return { alreadyImported: false, imported: runs.length };
+		});
+	}
+
+	async function save(session, options = {}) {
+		requireRun(session);
+		const expectedVersion = nonNegativeInteger(options.expectedVersion, 'expectedVersion');
+		return transaction(async client => {
+			const updatedAt = asDate(now(), Date.now());
+			const event = eventOptions(options, updatedAt, tenant);
+			const eventIncrement = event.type ? 1 : 0;
+			const result = await client.query(
+				`UPDATE qa_runs SET
+					title = $4, target_url = $5, status = $6, run_mode = $7,
+					sqa_profiles = $8, sqa_assessment = $9, founder_assessment = $10,
+					drytis_integration = $11, pending_question = $12, context_usage = $13, token_usage = $14, secret_names = $15,
+					message_count = $16, finding_count = $17, updated_at = $18,
+					feedback = $19,
+					lock_version = lock_version + 1,
+					next_event_sequence = next_event_sequence + $20,
+					started_at = COALESCE(started_at, $22), completed_at = COALESCE(completed_at, $23),
+					queued_at = COALESCE(queued_at, $24),
+					setup_started_at = COALESCE(setup_started_at, $25),
+					setup_ended_at = COALESCE(setup_ended_at, $26),
+					report_started_at = COALESCE(report_started_at, $27),
+					report_ended_at = COALESCE(report_ended_at, $28),
+					cancelled_at = COALESCE(cancelled_at, $29),
+					paused_at = $31,
+					paused_seconds = CASE
+						WHEN $31 IS NULL THEN COALESCE(paused_seconds, 0) + $32
+						ELSE COALESCE(paused_seconds, 0)
+					END,
+					failure_reason = CASE WHEN $30 IS NOT NULL THEN $30 ELSE failure_reason END,
+					engine = $33, device = $34, device_landscape = $35,
+					cohort = $36,
+					scope_selection = $38
+					WHERE organization_id = $1 AND project_id = $2 AND id = $3
+					AND lock_version = $37 AND deleted_at IS NULL
+					AND ($21::uuid IS NULL OR created_by_user_id = $21)
+					RETURNING lock_version, updated_at, next_event_sequence`,
+				[
+					tenant.organizationId, tenant.projectId, session.id,      // $1-$3
+					String(session.title ?? 'New test run'), session.targetUrl ?? null, // $4 $5
+					session.status ?? 'idle', runMode(session), sqaProfiles(session),  // $6-$8
+					runMode(session) === 'sqa' ? json(session.sqa) : null,   // $9
+					runMode(session) === 'founder' ? json(session.founder) : null, // $10
+					json(session.drytisIntegration), json(session.pendingQuestion), json(session.contextUsage), // $11-$13
+					json(session.tokenUsage), names(session.secretNames),    // $14 $15
+					session.messages?.length ?? 0, session.findings?.length ?? 0, // $16 $17
+					updatedAt,                                               // $18
+					json(session.feedback),                                   // $19
+					eventIncrement,                                          // $20
+					currentRequestActor()?.actorUserId ?? null,              // $21
+					// Write-once timing columns: existing values always win, so a
+					// retried or replayed save can never reset the timer.
+					asNullableDate(session.startedAt), asNullableDate(session.completedAt), // $22 $23
+					asNullableDate(session.queuedAt),                        // $24
+					asNullableDate(session.setupStartedAt),                  // $25
+					asNullableDate(session.setupEndedAt),                    // $26
+					asNullableDate(session.reportStartedAt),                 // $27
+					asNullableDate(session.reportEndedAt),                   // $28
+					asNullableDate(session.cancelledAt),                     // $29
+					session.failureReason ?? null,                            // $30
+					// Pause bookkeeping: $31 pausedAt (null = resume), $32 the
+					// just-closed interval to accumulate on resume.
+					asNullableDate(session.pausedAt),                        // $31
+					session.resumedPauseSeconds ?? 0,                        // $32
+					runEngine(session), runDevice(session), session.deviceLandscape === true, // $33-$35
+					runCohort(session),                                       // $36
+					expectedVersion,                                         // $37
+					scopeSelectionJson(session)                              // $38
+				]
+			);
+			if (!result.rows?.length) {
+				throw new RunVersionConflictError(session.id, expectedVersion);
+			}
+			await replaceChildren(client, tenant, session, updatedAt, childGroupsForEvent(event.type));
+			const nextSequence = Number(result.rows[0].next_event_sequence);
+			await appendEvent(client, tenant, session.id, nextSequence - eventIncrement, event, event.createdAt);
+			return {
+				version: Number(result.rows[0].lock_version),
+				updatedAt: epoch(result.rows[0].updated_at)
+			};
+		});
+	}
+
+	async function deleteRun(id, options = {}) {
+		if (typeof id !== 'string' || !UUID_PATTERN.test(id)) {
+			throw new TypeError('Run ID must be a canonical UUID.');
+		}
+		const hasVersion = options.expectedVersion !== undefined;
+		const expectedVersion = hasVersion
+			? nonNegativeInteger(options.expectedVersion, 'expectedVersion')
+			: undefined;
+		return transaction(async client => {
+			const parameters = [tenant.organizationId, tenant.projectId, id];
+			const correlationId = options.correlationId;
+			if (correlationId !== undefined && correlationId !== null
+				&& (typeof correlationId !== 'string' || !UUID_PATTERN.test(correlationId))) {
+				throw new TypeError('correlationId must be a canonical UUID when supplied.');
+			}
+			await client.query(
+				'SELECT pg_advisory_xact_lock(hashtextextended($1, 0))',
+				[`${tenant.organizationId}:${tenant.projectId}:${id}:lifecycle`]
+			);
+			const existing = await client.query(
+				`SELECT lock_version, next_event_sequence, deleted_at FROM qa_runs
+					 WHERE organization_id = $1 AND project_id = $2 AND id = $3
+					 AND ($4::uuid IS NULL OR created_by_user_id = $4)
+					 FOR UPDATE`,
+				[...parameters, currentRequestActor()?.actorUserId ?? null]
+			);
+			const row = existing.rows?.[0];
+			if (!row) return false;
+			if (row.deleted_at) return true;
+			if (hasVersion && Number(row.lock_version) !== expectedVersion) {
+				throw new RunVersionConflictError(id, expectedVersion);
+			}
+			const timestamp = databaseDate(await client.query('SELECT CURRENT_TIMESTAMP AS lifecycle_now'));
+			const event = eventOptions({
+				...options,
+				eventType: options.eventType ?? 'run.deleted',
+				payload: options.payload ?? { reasonCode: 'user_request' },
+				eventTs: options.eventTs ?? timestamp
+			}, timestamp, tenant);
+			const counts = await client.query(
+				`SELECT
+					(SELECT COUNT(*)::int FROM qa_messages
+					 WHERE organization_id = $1 AND project_id = $2 AND run_id = $3) AS messages,
+					(SELECT COUNT(*)::int FROM qa_activities
+					 WHERE organization_id = $1 AND project_id = $2 AND run_id = $3) AS activities,
+					(SELECT COUNT(*)::int FROM qa_plan_items
+					 WHERE organization_id = $1 AND project_id = $2 AND run_id = $3) AS plan_items,
+					(SELECT COUNT(*)::int FROM qa_findings
+					 WHERE organization_id = $1 AND project_id = $2 AND run_id = $3) AS findings,
+					(SELECT COUNT(*)::int FROM qa_reports
+					 WHERE organization_id = $1 AND project_id = $2 AND run_id = $3) AS reports,
+					(SELECT COUNT(*)::int FROM qa_run_events
+					 WHERE organization_id = $1 AND project_id = $2 AND run_id = $3) AS run_events,
+					(SELECT COUNT(*)::int FROM qa_execution_jobs
+					 WHERE organization_id = $1 AND project_id = $2 AND run_id = $3) AS execution_jobs`,
+				parameters
+			);
+			const countRow = counts.rows?.[0] ?? {};
+			const resourceCounts = {
+				messages: count(countRow.messages),
+				activities: count(countRow.activities),
+				planItems: count(countRow.plan_items),
+				findings: count(countRow.findings),
+				reports: count(countRow.reports),
+				runEvents: count(countRow.run_events),
+				executionJobs: count(countRow.execution_jobs)
+			};
+
+			const jobs = await client.query(
+				`UPDATE qa_execution_jobs SET
+					status = CASE WHEN status = 'queued' THEN 'cancelled' ELSE 'cancel_requested' END,
+					finished_at = CASE WHEN status = 'queued' THEN $4 ELSE finished_at END,
+					updated_at = $4
+				 WHERE organization_id = $1 AND project_id = $2 AND run_id = $3
+					AND status IN ('queued', 'leased')`,
+				[...parameters, timestamp]
+			);
+			const result = await client.query(
+				`UPDATE qa_runs SET
+					deleted_at = $4, deleted_by_user_id = $5,
+					status = CASE WHEN status IN ('running', 'awaiting_input') THEN 'interrupted' ELSE status END,
+					status_detail = 'Deleted by user request.', pending_question = NULL,
+					secret_names = ARRAY[]::text[], updated_at = $4,
+					lock_version = lock_version + 1, next_event_sequence = next_event_sequence + 1
+				 WHERE organization_id = $1 AND project_id = $2 AND id = $3 AND deleted_at IS NULL
+				 RETURNING next_event_sequence`,
+				[...parameters, timestamp, event.actorType === 'user' ? event.actorUserId : null]
+			);
+			if (!result.rows?.length) return false;
+			const lifecycleRequestId = randomUUID();
+			const lifecycleLeaseToken = randomUUID();
+			const cleanupRequestReference = `cleanup/${lifecycleRequestId}`;
+			const lifecycleActorType = event.actorType === 'agent' ? 'worker' : event.actorType;
+			const purgeAfter = new Date(timestamp.getTime() + retentionDays * DAY_MS);
+			const manifestSha256 = deletionManifest(tenant, id, resourceCounts);
+			await client.query(
+				`INSERT INTO qase_lifecycle_requests (
+					id, organization_id, project_id, subject_type, subject_id, action,
+					idempotency_key, requested_by_actor_type, requested_by_user_id,
+					reason_code, policy_version, purge_after, correlation_id, created_at, updated_at
+				) VALUES ($1,$2,$3,'run',$4,'soft_delete',$5,$6,$7,'user_request',$8,$9,$10,$11,$11)`,
+				[
+					lifecycleRequestId, tenant.organizationId, tenant.projectId, id,
+					`run:${id}:soft-delete`, lifecycleActorType,
+					event.actorType === 'user' ? event.actorUserId : null,
+					LIFECYCLE_POLICY_VERSION, purgeAfter, correlationId ?? null, timestamp
+				]
+			);
+			await client.query(
+				`INSERT INTO qase_run_cleanup (
+					organization_id, project_id, run_id, status, attempts, requested_at,
+					correlation_id, request_reference_id, policy_version
+				) VALUES ($1,$2,$3,'pending',0,$4,$5,$6,$7)`,
+				[
+					tenant.organizationId, tenant.projectId, id, timestamp,
+					correlationId ?? null, cleanupRequestReference, LIFECYCLE_POLICY_VERSION
+				]
+			);
+			await client.query(
+				`UPDATE qase_lifecycle_requests SET status = 'approved', updated_at = $4
+				 WHERE organization_id = $1 AND project_id = $2 AND id = $3 AND status = 'requested'`,
+				[tenant.organizationId, tenant.projectId, lifecycleRequestId, timestamp]
+			);
+			await client.query(
+				`UPDATE qase_lifecycle_requests SET status = 'processing', attempts = attempts + 1,
+					lease_owner = 'qase-api-soft-delete', lease_token = $5,
+					lease_expires_at = $6, started_at = $4, updated_at = $4
+				 WHERE organization_id = $1 AND project_id = $2 AND id = $3 AND status = 'approved'`,
+				[
+					tenant.organizationId, tenant.projectId, lifecycleRequestId, timestamp,
+					lifecycleLeaseToken, new Date(timestamp.getTime() + 300_000)
+				]
+			);
+			await appendEvent(
+				client,
+				tenant,
+				id,
+				Number(result.rows[0].next_event_sequence) - 1,
+				event,
+				timestamp
+			);
+			await client.query(
+				`INSERT INTO qase_lifecycle_events (
+					organization_id, project_id, request_id, subject_type, subject_id,
+					action, event_type, from_status, to_status, actor_type, actor_user_id,
+					reason_code, resource_counts, manifest_sha256, correlation_id,
+					policy_version, created_at
+				) VALUES ($1,$2,$3,'run',$4,'soft_delete','run.soft_deleted','processing','completed',$5,$6,
+					'user_request',$7,$8,$9,$10,$11)`,
+				[
+					tenant.organizationId, tenant.projectId, lifecycleRequestId, id,
+					lifecycleActorType, event.actorType === 'user' ? event.actorUserId : null,
+					{
+						...resourceCounts,
+						executionJobsFenced: Number(jobs.rowCount ?? jobs.rows?.length ?? 0)
+					},
+					manifestSha256, correlationId ?? null, LIFECYCLE_POLICY_VERSION, timestamp
+				]
+			);
+			const completed = await client.query(
+				`UPDATE qase_lifecycle_requests SET status = 'completed', finished_at = $4,
+					lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL, updated_at = $4
+				 WHERE organization_id = $1 AND project_id = $2 AND id = $3
+					AND status = 'processing' AND lease_token = $5`,
+				[
+					tenant.organizationId, tenant.projectId, lifecycleRequestId, timestamp,
+					lifecycleLeaseToken
+				]
+			);
+			if (completed.rowCount !== 1) {
+				throw new Error('Soft-delete lifecycle request could not be completed.');
+			}
+			return true;
+		});
+	}
+
+	async function recordCleanup(id, options = {}) {
+		if (typeof id !== 'string' || !UUID_PATTERN.test(id)) {
+			throw new TypeError('Run ID must be a canonical UUID.');
+		}
+		const status = String(options.status ?? '').trim();
+		if (!['completed', 'failed'].includes(status)) {
+			throw new TypeError('Cleanup status must be completed or failed.');
+		}
+		const actorType = String(options.actorType ?? 'system').trim();
+		if (!['system', 'worker'].includes(actorType)) {
+			throw new TypeError('Cleanup actorType must be system or worker.');
+		}
+		const errorCode = status === 'failed'
+			? lifecycleCode(options.errorCode, 'errorCode')
+			: null;
+		if (status === 'completed' && options.errorCode !== undefined && options.errorCode !== null) {
+			throw new TypeError('Completed cleanup cannot include errorCode.');
+		}
+		const reasonCode = lifecycleCode(
+			options.reasonCode ?? (status === 'completed' ? 'cleanup_completed' : errorCode),
+			'reasonCode'
+		);
+		const referenceId = lifecycleReference(options.referenceId);
+		if (status === 'completed' && !referenceId) {
+			throw new TypeError('Completed cleanup requires an attestation referenceId.');
+		}
+		return transaction(async client => {
+			const parameters = [tenant.organizationId, tenant.projectId, id];
+			await client.query(
+				'SELECT pg_advisory_xact_lock(hashtextextended($1, 0))',
+				[`${tenant.organizationId}:${tenant.projectId}:${id}:lifecycle`]
+			);
+			const selected = await client.query(
+				`SELECT status, attempts, completed_at, correlation_id,
+					request_reference_id, attestation_reference_id, policy_version
+				 FROM qase_run_cleanup
+				 WHERE organization_id = $1 AND project_id = $2 AND run_id = $3
+				 FOR UPDATE`,
+				parameters
+			);
+			const current = selected.rows?.[0];
+			if (!current) {
+				return { recorded: false, reason: 'not_found', runId: id };
+			}
+			if (current.status === 'completed') {
+				if (referenceId && referenceId !== current.attestation_reference_id) {
+					const error = new Error('Run cleanup is already bound to a different attestation reference.');
+					error.code = 'QASE_CLEANUP_ATTESTATION_CONFLICT';
+					throw error;
+				}
+				return {
+					recorded: false,
+					reason: 'already_completed',
+					runId: id,
+					status: 'completed',
+					attempts: Number(current.attempts),
+					completedAt: epoch(current.completed_at)
+				};
+			}
+			const timestamp = databaseDate(await client.query('SELECT CURRENT_TIMESTAMP AS lifecycle_now'));
+			const attestationReference = status === 'completed' ? referenceId : null;
+			const updated = await client.query(
+				`UPDATE qase_run_cleanup SET
+					status = $4, attempts = attempts + 1, last_attempt_at = $5,
+					completed_at = CASE WHEN $4 = 'completed' THEN $5 ELSE NULL END,
+					last_error_code = $6,
+					attestation_reference_id = CASE WHEN $4 = 'completed' THEN $7 ELSE NULL END
+				 WHERE organization_id = $1 AND project_id = $2 AND run_id = $3
+					AND status <> 'completed'
+				 RETURNING status, attempts, completed_at, correlation_id,
+					attestation_reference_id, policy_version`,
+				[...parameters, status, timestamp, errorCode, attestationReference]
+			);
+			const row = updated.rows?.[0];
+			if (!row) throw new Error('Run cleanup attestation changed concurrently.');
+			await client.query(
+				`INSERT INTO qase_lifecycle_events (
+					organization_id, project_id, subject_type, subject_id, action, event_type,
+					from_status, to_status, actor_type, reason_code, reference_id,
+					resource_counts, correlation_id, policy_version, created_at
+				) VALUES ($1,$2,'run',$3,'cleanup',$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
+				[
+					tenant.organizationId, tenant.projectId, id,
+					`run.cleanup_${status}`, current.status === 'pending' ? null : current.status,
+					status, actorType, reasonCode,
+					referenceId ?? row.attestation_reference_id ?? current.request_reference_id,
+					{ attempt: Number(row.attempts) }, row.correlation_id ?? null,
+					row.policy_version, timestamp
+				]
+			);
+			return {
+				recorded: true,
+				runId: id,
+				status,
+				attempts: Number(row.attempts),
+				completedAt: epoch(row.completed_at)
+			};
+		});
+	}
+
+	async function check() {
+		return transaction(async client => {
+			await client.query(
+				`SELECT 1 FROM qa_runs
+				 WHERE organization_id = $1 AND project_id = $2
+				 LIMIT 1`,
+				[tenant.organizationId, tenant.projectId]
+			);
+			return {
+				ready: true,
+				organizationId: tenant.organizationId,
+				projectId: tenant.projectId
+			};
+		});
+	}
+
+	/**
+	 * Duration aggregates for the Performance panel: min/max/avg/median over
+	 * completed runs, plus optional per-target filtering for comparison.
+	 */
+	async function durationAnalytics({ targetUrl, limit = 100 } = {}) {
+		const boundedLimit = boundedInteger(limit, 100, 1, 100, 'limit');
+		return transaction(async client => {
+			const parameters = [tenant.organizationId, tenant.projectId, boundedLimit];
+			let targetFilter = '';
+			if (targetUrl !== undefined && targetUrl !== null && targetUrl !== '') {
+				targetFilter = ' AND target_url = $3';
+				parameters.push(String(targetUrl));
+			}
+			const result = await client.query(
+				`WITH completed AS (
+					SELECT target_url, started_at, completed_at,
+						GREATEST(0, EXTRACT(EPOCH FROM (completed_at - started_at)) - COALESCE(paused_seconds, 0)) AS duration_seconds,
+						message_count, finding_count
+					FROM qa_runs
+					WHERE organization_id = $1 AND project_id = $2 AND deleted_at IS NULL
+						AND status IN ('done', 'error', 'interrupted')
+						AND started_at IS NOT NULL AND completed_at IS NOT NULL
+						${targetFilter}
+					ORDER BY completed_at DESC
+					LIMIT $3
+				)
+				SELECT
+					COUNT(*)::int AS run_count,
+					MIN(duration_seconds) AS min_duration_seconds,
+					MAX(duration_seconds) AS max_duration_seconds,
+					AVG(duration_seconds) AS avg_duration_seconds,
+					PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY duration_seconds) AS median_duration_seconds,
+					AVG(CASE WHEN message_count + finding_count > 0
+						THEN duration_seconds / (message_count + finding_count) END) AS avg_seconds_per_item
+					FROM completed`,
+				parameters
+			);
+			const row = result.rows?.[0] ?? {};
+			const perTarget = await client.query(
+				`SELECT target_url, COUNT(*)::int AS run_count,
+					AVG(GREATEST(0, EXTRACT(EPOCH FROM (completed_at - started_at)) - COALESCE(paused_seconds, 0))) AS avg_duration_seconds
+				 FROM qa_runs
+				 WHERE organization_id = $1 AND project_id = $2 AND deleted_at IS NULL
+					AND started_at IS NOT NULL AND completed_at IS NOT NULL
+				 GROUP BY target_url ORDER BY MAX(completed_at) DESC LIMIT 20`,
+				[tenant.organizationId, tenant.projectId]
+			);
+			const read = value => (value === null || value === undefined ? undefined : Number(value));
+			return {
+				runCount: read(row.run_count) ?? 0,
+				minDurationSeconds: read(row.min_duration_seconds),
+				maxDurationSeconds: read(row.max_duration_seconds),
+				avgDurationSeconds: read(row.avg_duration_seconds),
+				medianDurationSeconds: read(row.median_duration_seconds),
+				avgSecondsPerItem: read(row.avg_seconds_per_item),
+				byTarget: (perTarget.rows ?? []).map(entry => ({
+					targetUrl: entry.target_url ?? undefined,
+					runCount: Number(entry.run_count ?? 0),
+					avgDurationSeconds: read(entry.avg_duration_seconds)
+				}))
+			};
+		});
+	}
+
+	/**
+	 * Chronological durations for one target, for run-over-run trend
+	 * comparison ("is testing this site getting faster or slower?").
+	 */
+	async function targetDurationHistory(targetUrl, { limit = 20 } = {}) {
+		if (typeof targetUrl !== 'string' || targetUrl.trim() === '') {
+			throw new TypeError('targetUrl must be a non-empty string.');
+		}
+		const boundedLimit = boundedInteger(limit, 20, 1, 100, 'limit');
+		return transaction(async client => {
+			const result = await client.query(
+				`SELECT id, status, started_at, completed_at, ${timingSelect()}
+				 FROM qa_runs
+				 WHERE organization_id = $1 AND project_id = $2 AND deleted_at IS NULL
+					AND target_url = $3 AND started_at IS NOT NULL AND completed_at IS NOT NULL
+				 ORDER BY started_at ASC LIMIT $4`,
+				[tenant.organizationId, tenant.projectId, targetUrl.trim(), boundedLimit]
+			);
+			return (result.rows ?? []).map(row => ({
+				id: row.id,
+				status: row.status,
+				startedAt: epoch(row.started_at),
+				completedAt: epoch(row.completed_at),
+				...readTiming(row)
+			}));
+		});
+	}
+
+	function close() {
+		closePromise ??= Promise.resolve().then(() => pool.end());
+		return closePromise;
+	}
+
+	async function getFounderProjectState() {
+		return transaction(async client => {
+			const result = await client.query(
+				`SELECT state FROM founder_project_state
+				 WHERE organization_id = $1 AND project_id = $2`,
+				[tenant.organizationId, tenant.projectId]
+			);
+			return result.rows?.[0]?.state ?? undefined;
+		});
+	}
+
+	async function saveFounderProjectState(state) {
+		return transaction(async client => {
+			await client.query(
+				`INSERT INTO founder_project_state (organization_id, project_id, state, updated_at)
+				 VALUES ($1, $2, $3::jsonb, $4)
+				 ON CONFLICT (organization_id, project_id) DO UPDATE SET
+					state = EXCLUDED.state, updated_at = EXCLUDED.updated_at`,
+				[tenant.organizationId, tenant.projectId, JSON.stringify(state), asDate(now(), Date.now())]
+			);
+			return true;
+		});
+	}
+
+	return {
+		bootstrapTenant,
+		loadAll,
+		get,
+		list,
+		create,
+		importBatch,
+		save,
+		delete: deleteRun,
+		recordCleanup,
+		durationAnalytics,
+		targetDurationHistory,
+		check,
+		close,
+		getFounderProjectState,
+		saveFounderProjectState,
+		get pool() {
+			return pool;
+		}
+	};
+}
+
